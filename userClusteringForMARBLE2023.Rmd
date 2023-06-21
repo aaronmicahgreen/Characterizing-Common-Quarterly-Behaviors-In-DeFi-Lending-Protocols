@@ -1,0 +1,860 @@
+```{r setup, include=FALSE}
+# Set the default CRAN repository
+local({r <- getOption("repos")
+       r["CRAN"] <- "http://cran.r-project.org" 
+       options(repos=r)
+})
+# Set code chunk defaults
+knitr::opts_chunk$set(echo = TRUE)
+
+# Load required packages; install if necessary
+if (!require("ggplot2")) {
+  install.packages("ggplot2")
+  library(ggplot2)
+}
+if (!require("RColorBrewer")) {
+  install.packages("RColorBrewer")
+  library(RColorBrewer)
+}
+if (!require("lubridate")) {
+  install.packages("lubridate")
+  library(lubridate)
+}
+if (!require("tidyverse")) {
+  install.packages("tidyverse")
+  library(tidyverse)
+}
+if (!require("caret")) {
+  install.packages("caret")
+  library(caret)
+}
+if (!require("e1071")) {
+  install.packages("e1071")
+  library(e1071)
+}
+if (!require("lamW")) {
+  install.packages("lamW")
+  library(lamW)
+}
+if (!require("factoextra")) {
+  install.packages("factoextra")
+  library(factoextra)
+}
+if (!require("clusterSim")) {
+  install.packages("clusterSim")
+  library(clusterSim)
+}
+if(!require("Rtsne")){
+  install.packages("Rtsne")
+  library(Rtsne)
+}
+if(!require("rpart")){
+  install.packages("rpart")
+  library(rpart)
+  library(rpart.plot)
+}
+if(!require("pheatmap")){
+  install.packages("pheatmap")
+  library(pheatmap)
+}
+if(!require("plyr")){
+  install.packages("plyr")
+  library(plyr)
+}
+
+if(!require("dplyr")){
+  install.packages("dplyr")
+  library(dplyr)
+}
+if(!require("reshape2")){
+  install.packages("reshape2")
+  library(reshape2)
+}
+if(!require("cowplot")){
+  install.packages("cowplot")
+  library(cowplot)
+}
+if(!require("ppclust")){
+  install.packages("ppclust")
+  library(ppclust)
+}
+if(!require("gridExtra")){
+  install.packages("gridExtra")
+  library(gridExtra)
+}
+if(!require("htmlTable")){
+  install.packages("htmlTable")
+  library(htmlTable)
+}
+
+if(!require("sClust")){
+  install.packages("sClust")
+  library(sClust)
+}
+if(!require("ggsankey")){
+  remotes::install_github("davidsjoberg/ggsankey")
+  library(ggsankey)
+}
+if(!require("ggpubr")){
+  install.packages("ggpubr")
+  library(ggpubr)
+}
+options(dplyr.summarise.inform = FALSE)
+
+
+pubFontSize = 14
+pubWidth = 11
+pubHeight = 8.5
+pubColorScheme = "Set3"
+```
+
+## Data Source
+
+```{r}
+## Helper functions
+not_all_na <- function(x) any(!is.na(x))
+`%notin%` <- Negate(`%in%`)
+# Load the data from the IDEA server:
+# Set data path
+dataPath = "~/data/IDEA_DeFi_Research/Data/" # Main data directory
+lendingProtocolsPath = "Lending_Protocols/"
+aavePath = "Aave/V2/" # AAVE data directory
+mainnetPath = "Mainnet/" # AAVEv2 mainnet directory
+
+# Set data filenames
+transactionFileName = "transactions.csv"
+reserveInfoPath = "Coin_Info/"
+reserveInfoFileName = "stablecoins.csv"
+
+# Define data directory
+dataDir = paste(dataPath, lendingProtocolsPath, aavePath, mainnetPath, sep="")
+reservePath = paste(dataPath, reserveInfoPath, sep="")
+
+# Load the mainnet data:
+mainnetTransactions <- read_csv(paste0(dataDir, transactionFileName))
+mainnetReserveInfo <- read_csv(paste(reservePath, reserveInfoFileName, sep=""))
+lendingAddresses <- read_csv("~/data/IDEA_DeFi_Research/Data/Addresses/ethereumLendingAddresses.csv")
+
+mainnetTransactions <- mainnetTransactions %>%
+  mutate(datetime = as_datetime(timestamp)) %>%
+  mutate(quarter = paste0(year(datetime)," Q", quarter(datetime))) %>%
+  filter(type != "flashLoan" & type != "swap")
+```
+
+The data we are using for this project is Aave v2 mainnet transaction history and reserve information. 
+
+```{r}
+# Remove the few transactions from the data that involve Amm coins:
+nonAmmCoins <- mainnetTransactions %>%
+  dplyr::select(reserve) %>%
+  distinct() %>%
+  filter(substr(reserve, 1, 3) != 'Amm')
+
+nonAmmPrincipalCoins <- mainnetTransactions %>%
+  dplyr::select(principalReserve) %>%
+  distinct() %>%
+  filter(substr(principalReserve, 1, 3) != "Amm") %>%
+  dplyr::rename(reserve = principalReserve)
+
+nonAmmCollateralCoins <- mainnetTransactions %>%
+  dplyr::select(collateralReserve) %>%
+  distinct() %>%
+  filter(substr(collateralReserve, 1, 3) != "Amm") %>%
+  dplyr::rename(reserve = collateralReserve)
+
+nonAmmCoins <- nonAmmCoins %>%
+  bind_rows(nonAmmPrincipalCoins,
+            nonAmmCollateralCoins) %>%
+  distinct()
+
+nonAmmLiquidations <- mainnetTransactions %>%
+  filter(type == "liquidation") %>%
+  filter(principalReserve %in% nonAmmCoins$reserve & collateralReserve %in% nonAmmCoins$reserve)
+
+nonAmmTransactions <- mainnetTransactions %>%
+  filter(type != "liquidation") %>%
+  filter(reserve %in% nonAmmCoins$reserve) %>%
+  bind_rows(nonAmmLiquidations)
+```
+
+```{r}
+# Filter out transactions that occurred in 2020 Q4 and 2023 Q1:
+df <- nonAmmTransactions %>% 
+  arrange(timestamp) %>% 
+  dplyr::filter(quarter != "2020 Q4" & quarter != "2023 Q1")
+```
+
+```{r}
+# Extract all relevant address-quarter combinations for clustering
+userAddresses <- df %>%
+  dplyr::select(user, quarter) %>%
+  distinct()
+
+liquidatorAddresses <- df %>%
+  dplyr::select(liquidator, quarter) %>%
+  dplyr::rename(user = liquidator) %>%
+  distinct()
+
+onBehalfOfAddresses <- df %>%
+  dplyr::select(onBehalfOf, quarter) %>%
+  dplyr::rename(user = onBehalfOf) %>%
+  distinct()
+
+allAddressQuarters <- userAddresses %>%
+  bind_rows(liquidatorAddresses) %>%
+  bind_rows(onBehalfOfAddresses) %>%
+  distinct() %>%
+  drop_na()
+```
+
+```{r}
+# Add "Smart Contract?" flag for addressQuarters:
+lendingAddresses <- lendingAddresses %>%
+  dplyr::select(address, addressType)
+
+addressQuarterClusteringData <- allAddressQuarters %>%
+  left_join(lendingAddresses, by = c("user" = "address")) %>%
+  mutate(`Smart Contract?` = case_when(addressType == "EOA" ~ 0,
+                                       TRUE ~ 1))
+```
+
+```{r}
+# Add "New User?" feature:
+firstQuarters <- addressQuarterClusteringData %>%
+  group_by(user) %>%
+  arrange(quarter) %>%
+  slice_min(quarter) %>%
+  ungroup() %>%
+  mutate(`New User?` = 1) %>%
+  dplyr::select(user, quarter, `New User?`)
+
+addressQuarterClusteringData <- addressQuarterClusteringData %>%
+  left_join(firstQuarters, by = c("user", "quarter")) %>%
+  mutate(`New User?` = case_when(is.na(`New User?`) ~ 0,
+                                 TRUE ~ `New User?`))
+
+```
+
+```{r}
+# Add counts and amounts of each transaction type to clustering data:
+borrowFeatures <- df %>%
+  filter(type == "borrow") %>%
+  group_by(user, quarter) %>%
+  dplyr::summarize(borrowCount = n(), borrowValue = sum(amountUSD))
+
+depositFeatures <- df %>%
+  filter(type == "deposit") %>%
+  group_by(user, quarter) %>%
+  dplyr::summarize(depositCount = n(), depositValue = sum(amountUSD))
+
+collateralFeatures <- df %>%
+  filter(type == "collateral") %>%
+  group_by(user, quarter) %>%
+  dplyr::summarise(collateralCount = n())
+
+withdrawFeatures <- df %>%
+  filter(type == "withdraw") %>%
+  group_by(user, quarter) %>%
+  dplyr::summarize(withdrawCount = n(), withdrawValue = sum(amountUSD))
+
+repayFeatures <- df %>%
+  filter(type == "repay") %>%
+  group_by(user, quarter) %>%
+  dplyr::summarize(repayCount = n(), repayValue = sum(amountUSD))
+
+liquidationsPerformedFeatures <- df %>%
+  filter(type == "liquidation") %>%
+  dplyr::rename(liquidatee = user,
+         user = liquidator) %>%
+  group_by(user, quarter) %>%
+  dplyr::summarize(liquidationsPerformedCount = n(), 
+                   liquidationsPerformedValue = sum(principalAmountUSD), 
+                   liquidationsPerformedProfit = sum(collateralAmountUSD) - sum(collateralAmountUSD))
+
+liquidatedFeatures <- df %>%
+  filter(type == "liquidation") %>%
+  group_by(user, quarter) %>%
+  dplyr::summarize(liquidatedCount = n(), liquidatedValue = sum(principalAmountUSD))
+
+addressQuarterClusteringData <- addressQuarterClusteringData %>%
+  left_join(borrowFeatures, by = c("user", "quarter")) %>%
+  left_join(depositFeatures, by = c("user", "quarter")) %>%
+  left_join(collateralFeatures, by = c("user", "quarter")) %>%
+  left_join(withdrawFeatures, by = c("user", "quarter")) %>%
+  left_join(repayFeatures, by = c("user", "quarter")) %>%
+  left_join(liquidationsPerformedFeatures, by = c("user", "quarter")) %>%
+  left_join(liquidatedFeatures, by = c("user", "quarter"))
+
+# We can replace 'NA' vals with 0s here safely because every 'NA' introduced from above is for a numeric variable
+addressQuarterClusteringData[is.na(addressQuarterClusteringData)] <- 0
+
+addressQuarterClusteringData <- addressQuarterClusteringData %>%
+  mutate(totalTransactionCount = borrowCount + repayCount + collateralCount + depositCount + withdrawCount + liquidationsPerformedCount,
+         averageAmountPerTransaction = (borrowValue + repayValue + depositValue + withdrawValue + liquidationsPerformedValue) / (totalTransactionCount - collateralCount))
+
+```
+
+```{r}
+# Add a feature for the percentage of each address's borrows that are stable borrow rates:
+propStableBorrow <- df %>%
+  filter(type == "borrow") %>%
+  mutate(numStableBorrow = as.numeric(as.factor(borrowRateMode))-1) %>% 
+  group_by(user, quarter) %>% 
+  dplyr::summarise(propStableBorrow = mean(numStableBorrow))
+
+addressQuarterClusteringData <- addressQuarterClusteringData %>%
+  left_join(propStableBorrow, by = c("user", "quarter"))
+
+# We can replace 'NA' vals with 0s here safely because every 'NA' introduced from above is for a numeric variable
+addressQuarterClusteringData[is.na(addressQuarterClusteringData)] <- 0
+```
+
+```{r}
+# Create activeCollaterals feature:
+userActiveCollaterals <- df %>%
+  filter(type == "collateral") %>%
+  group_by(user, quarter, reserve) %>%
+  slice_max(timestamp) %>%
+  filter(toState == TRUE) %>%
+  ungroup() %>%
+  group_by(user, quarter) %>%
+  dplyr::summarise(numActiveCollaterals=n())
+
+addressQuarterClusteringData <- addressQuarterClusteringData %>%
+  left_join(userActiveCollaterals, by = c("user", "quarter"))
+
+addressQuarterClusteringData[is.na(addressQuarterClusteringData)] <- 0
+```
+
+```{r}
+# Make a feature about the number of active days each address has per quarter:
+userActiveDays <- df %>%
+  group_by(user, quarter) %>%
+  mutate(transactionDay = floor_date(as_datetime(timestamp), unit = "day")) %>%
+  ungroup() %>%
+  dplyr::select(user, quarter, transactionDay) %>%
+  distinct() %>%
+  group_by(user, quarter) %>%
+  dplyr::summarize(activeDays = n())
+
+addressQuarterClusteringData <- addressQuarterClusteringData %>%
+  left_join(userActiveDays, by = c("user", "quarter"))
+
+addressQuarterClusteringData[is.na(addressQuarterClusteringData)] <- 0
+```
+
+```{r}
+# Make sure we select exactly the features we want to cluster on:
+addressQuarterClusteringData <- addressQuarterClusteringData %>%
+  dplyr::select(user,
+         quarter,
+         newUser = `New User?`,
+         smartContract = `Smart Contract?`,
+         liquidationsPerformedCount,
+         liquidationsPerformedValue,
+         liquidatedCount,
+         liquidatedValue,
+         depositCount,
+         depositValue,
+         withdrawCount,
+         withdrawValue,
+         numActiveCollaterals,
+         collateralCount,
+         borrowCount,
+         borrowValue,
+         propStableBorrow,
+         repayCount,
+         repayValue,
+         activeDays,
+         totalTransactionCount,
+         averageAmountPerTransaction)
+
+# Drop the columns of user id and quarter from the clustering data
+userIDsbyQuarter <- addressQuarterClusteringData %>% 
+  dplyr::select(user, quarter)
+addressQuarterClusteringData <- addressQuarterClusteringData %>%
+  dplyr::select(-user, -quarter)
+```
+
+```{r, fig.width=6, fig.height=10}
+
+p1 <- plot_grid(plotlist = lapply(colnames(addressQuarterClusteringData), function(var_x){
+  if(length(unique(addressQuarterClusteringData[[var_x]])) < 250) {
+    p1 <- ggplot(addressQuarterClusteringData %>% filter(.data[[var_x]] < 25)) +
+      aes_string(var_x) + 
+      geom_bar()
+  } else {
+    p1 <- ggplot(addressQuarterClusteringData %>% filter(.data[[var_x]] < 50)) +
+      aes_string(var_x) + 
+      geom_density()
+  } 
+}), ncol = 3, nrow=7)
+
+p1
+```
+
+```{r}
+corr_mat <- round(cor(addressQuarterClusteringData), 2)
+melted_corr_mat <- melt(corr_mat)
+p2 <- ggplot(data = melted_corr_mat, aes(x=Var1, y=Var2, fill=value)) +
+  theme(axis.text.x = element_text(angle = 45, hjust=1)) +
+  geom_tile(aes(fill = value)) +
+  geom_text(aes(label = round(value, 1))) +
+  scale_fill_gradient2(low = "#0096FF", mid="white", high = "#FFA500") +
+  labs(title="Correlation matrix heatmap", x="", y="")  + scale_y_discrete(limits=rev)
+
+p2
+```
+
+
+```{r}
+# Scale data before clustering
+scaledData <- addressQuarterClusteringData %>% mutate_all(lambertW0)
+```
+
+```{r}
+# Set a pre-defined range for the number of clusters
+minNumCluster <- 5
+maxNumCluster <- 12
+
+# Set seed for randomness
+SEED <- 69
+set.seed(SEED) # Set a fixed randomness
+
+# Get 10,000 random samples
+sampleIdx10k <- sample(1:nrow(scaledData), 10000)
+sampleData10k <- scaledData[sampleIdx10k,]
+
+# Get 30,000 random samples
+sampleIdx30k <- sample(1:nrow(scaledData), 21215)
+sampleData30k <- scaledData[sampleIdx30k,]
+
+set.seed(SEED) # Set a fixed randomness
+nClustElbow <- fviz_nbclust(sampleData10k, kmeans, method = "wss", k.max = 15) +
+  theme_minimal() + 
+  ggtitle("The Elbow Method")
+
+nClustElbow
+
+set.seed(SEED) # Set a fixed randomness
+nClustSilhouette <- fviz_nbclust(sampleData10k, kmeans, method = "silhouette", k.max = maxNumCluster) +
+  theme_minimal() + 
+  ggtitle("The Silhouette Plot")
+
+nClustSilhouette
+
+bestCluster <- nClustSilhouette$data[minNumCluster:maxNumCluster,] %>% 
+  arrange(-y)
+numCluster <- as.integer(bestCluster[1,1])
+c("Optimal number of cluster:", numCluster)
+```
+
+```{r}
+numCluster = 8
+# Run fuzzy c-means clustering
+cM <- fcm(scaledData, centers=numCluster, iter.max=200)
+
+# Get and save fuzzy c-means clusters
+clusteringDataCMeans <- cbind(addressQuarterClusteringData,
+                              cluster = cM$cluster,
+                              quarter=userIDsbyQuarter$quarter)
+
+# Get and save fuzzy c-means cluster centers
+cmeansCenters <- data.frame(cM$v)
+cmeansClusters <- clusteringDataCMeans$cluster
+
+# Dimension Reduction Using T-SNE 
+set.seed(SEED) # Set a fixed randomness
+reducedDimData <- Rtsne(sampleData10k, dims=2, perplexity=50, check_duplicates=FALSE)
+reducedDimData <- data.frame(reducedDimData$Y)
+
+sampleCluster2 <- cmeansClusters[sampleIdx10k]
+
+# Clustering visualization using T-SNE
+p3 <- ggplot(reducedDimData, aes(x=X1, y=X2, color=factor(sampleCluster2))) +
+  geom_point(size=0.5) + guides(color = guide_legend(override.aes = list(size=10))) +
+  labs(color="Cluster") +
+  labs(title="T-SNE Visualization With 8 Clusters (Fuzzy C-means)")
+
+p3
+```
+
+
+```{r}
+save_pheatmap_pdf <- function(x, filename, width=7, height=7) {
+   stopifnot(!missing(x))
+   stopifnot(!missing(filename))
+   pdf(filename, width=width, height=height)
+   grid::grid.newpage()
+   grid::grid.draw(x$gtable)
+   dev.off()
+}
+
+rownames(cmeansCenters) <- c("C4", "C7", "C2", "C3", "C8", "C1", "C6", "C5")
+cmeansClusters <- mapvalues(cmeansClusters, from=1:8, to=c(4, 7, 2, 3, 8, 1, 6, 5))
+
+
+clusterLabels = c("Whales (C1)",
+                  "Retail Savers (C2)",
+                  "Experienced Keepers (C3)",
+                  "Highest Risk Behavior (C4)",
+                  "Yield Farming (C5)",
+                  "Inactives (C6)",
+                  "New Keepers (C7)",
+                  "Retail Keepers (C8)")
+
+clusteringDataCMeans$cluster <- cmeansClusters
+
+clusterHeatmap <- pheatmap(t(cmeansCenters), scale="row", treeheight_row=0, main="Average Feature Values by Cluster", legend = FALSE, angle_col=0)
+
+save_pheatmap_pdf(clusterHeatmap, "~/DAR_F22/DAR_F22/User Clustering/Images/heatmap.pdf", width = 5, height = 4)
+
+```
+### Feature Importance
+
+```{r}
+fit <- rpart(cluster~., 
+             data = cbind(addressQuarterClusteringData, cluster=cmeansClusters), 
+             method = 'class')
+
+variableImportance <- data.frame(importance = fit[12]$variable.importance)
+variableImportance <- cbind(feature = rownames(variableImportance), variableImportance)
+rownames(variableImportance) <- 1:nrow(variableImportance)
+variableImportancePlot <- ggplot(variableImportance, aes(x=reorder(feature,importance), y=importance,fill=importance))+ 
+  geom_bar(stat="identity", position="dodge")+ coord_flip()+
+  ylab("Variable Importance")+
+  xlab("")+
+  ggtitle("Information Value Summary")+
+  scale_fill_gradient(low="red", high="blue")
+
+variableImportancePlot
+```
+
+# In this chunk, we set up the transactions data with proper attached to each transaction, and for ease of use we make liquidationsPerformed and liquidated transactions use principalAmountUSD as amountUSD.
+```{r}
+userClustersLam <- cbind.data.frame(cmeansClusters, userIDsbyQuarter) %>%
+  distinct() %>% 
+  dplyr::rename(clusterLam = `cmeansClusters`)
+
+modifiedLiquidationsPerformed <- df %>%
+  filter(type == "liquidation") %>%
+  mutate(amountUSD = principalAmountUSD) %>%
+  mutate(user = liquidator) %>%
+  mutate(type = "liquidationPerformed")
+
+modifiedLiquidated <- df %>%
+  filter(type == "liquidation") %>%
+  mutate(amountUSD = principalAmountUSD) %>%
+  mutate(type = "liquidated")
+
+dfModifiedLiq <- df %>%
+  filter(type != "liquidation") %>%
+  bind_rows(modifiedLiquidationsPerformed,
+            modifiedLiquidated)
+
+dfWithClusters <- dfModifiedLiq %>%
+  left_join(userClustersLam, by = c("user", "quarter"))
+
+
+
+```
+
+```{r}
+transactionCountsByCluster <- dfWithClusters %>%
+  group_by(clusterLam, quarter) %>%
+  dplyr::summarize(count = n())
+
+
+transactionsOverTime <- ggplot(transactionCountsByCluster, aes(fill=as.factor(clusterLam), y=count/1e3, x=quarter)) +
+  geom_bar(stat="identity") +
+  labs(title="Number of Transactions Per Cluster by Quarter") +
+  scale_fill_brewer(name = "Cluster Name (Number)",
+                      labels = clusterLabels,
+                 palette = "Set1") +
+  ylab("Number of Transactions (in thousands)") +
+  xlab("Quarter")
+
+transactionsOverTime
+```
+
+
+```{r}
+pubFontSize = 14
+pubWidth = 12
+pubHeight = 6
+pubColorScheme = "Set1"
+
+image=ggpubr::ggpar(transactionsOverTime,
+              font.legend = list(size = pubFontSize),
+              font.xtickslab = list(size = pubFontSize),
+              font.ytickslab = list(size = pubFontSize),
+              font.x = list(size = pubFontSize),
+              font.y = list(size = pubFontSize))
+ggsave(file="./Images/transactionsOverTime.pdf", plot=image, width=pubWidth, height=pubHeight)
+```
+
+```{r}
+transactionTypesPerClusterPlot <- ggplot(data = dfWithClusters, aes(x = quarter, group = clusterLam,
+                                       fill = as.factor(clusterLam))) +
+  geom_bar() +
+  facet_wrap(~type, scale = "free_y", ncol = 3) +
+  ggtitle("Transaction Types Over Quarters by User Cluster") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 6)) +
+ guides(fill=guide_legend(title="Cluster")) + 
+  scale_fill_discrete(labels=clusterLabels)
+
+transactionTypesPerClusterPlot
+```
+
+```{r}
+
+transactionAmountsByClusterAndQuarter <- dfWithClusters %>%
+  mutate(amountUSD = case_when(is.na(amountUSD) ~ 0,
+                               TRUE ~ amountUSD)) %>%
+  group_by(quarter, clusterLam, type) %>%
+  dplyr::summarize(totalAmount = sum(amountUSD)) %>%
+  filter(type != "collateral")
+
+transactionAmountsOverTime <- ggplot(data = transactionAmountsByClusterAndQuarter, 
+             aes(x = quarter, y= totalAmount/1e8, 
+                 group = clusterLam, fill = as.factor(clusterLam))) +
+  geom_col() +
+  facet_wrap(~type, scale = "free_y", ncol = 2) +
+  ggtitle("USD Values of Transactions Made Per Cluster") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 6)) +
+  scale_fill_brewer(name = "Cluster Name (Number)",
+                      labels = clusterLabels,
+                 palette = "Set1") +
+  ylab("Total USD Value (in hundred-millions)") + 
+  xlab("Quarter")
+
+transactionAmountsOverTime
+
+
+```
+
+```{r}
+c6Liquidatees <- dfWithClusters %>%
+  filter(clusterLam == 6) %>%
+  filter(type == "liquidated") %>%
+  group_by(user) %>%
+  dplyr::summarize(totalAmtLiquidated = sum(amountUSD))
+
+mean(c6Liquidatees$totalAmtLiquidated)
+  
+meanTransactionAmountsByCluster <- dfWithClusters %>%
+  filter(type != "collateral") %>%
+  group_by(clusterLam) %>%
+  dplyr::summarize(averageTransactionAmount = mean(amountUSD))
+```
+
+```{r}
+
+pubFontSize = 12
+pubWidth = 8
+pubHeight = 5
+pubColorScheme = "Set1"
+
+image=ggpubr::ggpar(transactionAmountsOverTime,
+              font.legend = list(size = pubFontSize),
+              font.xtickslab = list(size = pubFontSize),
+              font.ytickslab = list(size = pubFontSize),
+              font.x = list(size = pubFontSize),
+              font.y = list(size = pubFontSize))
+ggsave(file="./Images/transactionAmountsOverTime.pdf", plot=image, width=pubWidth, height=pubHeight)
+```
+
+```{r}
+clusterSizes <- userClustersLam %>%
+  group_by(clusterLam) %>%
+  dplyr::summarize(amount = n()) %>%
+  mutate(totalAmount = sum(amount)) %>%
+  mutate(percentage = 100*(amount / totalAmount)) 
+```
+
+
+```{r}
+userQuarterClusters <- userClustersLam %>%
+  dplyr::rename(cluster = clusterLam)
+
+quarters <- data.frame(
+  quarter = c("2021 Q1", "2021 Q2", "2021 Q3", "2021 Q4", "2022 Q1", "2022 Q2", "2022 Q3", "2022 Q4"),
+  cluster = c(0, 0, 0, 0, 0, 0, 0, 0)
+  
+)
+distinctAddresses <- userQuarterClusters %>%
+  dplyr::select(user) %>%
+  distinct()
+
+# We are manually defining cluster 0 to include users who we know will eventually make transactions, but haven't yet
+# We are manually defining cluster -1 to include users who have transacted in the past, but made no transactions in this quarter
+
+
+allUserQuarters <- crossing(distinctAddresses, quarters) %>%
+  left_join(userQuarterClusters, by = c("user", "quarter"))
+
+allUserQuarters[is.na(allUserQuarters)] <- 0
+
+allUserQuarters <- allUserQuarters %>%
+  mutate(cluster = cluster.x + cluster.y) %>%
+  dplyr::select(user, quarter, cluster)
+
+allUserQuarterClusters <- allUserQuarters %>%
+  dplyr::group_by(user) %>%
+  dplyr::mutate(existingAccount = cumsum(cluster)) %>%
+  dplyr::mutate(cluster = case_when(cluster == 0 & existingAccount > 0 ~ 9,
+                             TRUE ~ cluster)) %>%
+  dplyr::select(-existingAccount) %>%
+  dplyr::mutate(nextQuarter = lead(quarter),
+                nextCluster = lead(cluster)) %>%
+  dplyr::mutate(currentClusterQuarter = paste0(quarter, ": ", cluster),
+                nextClusterQuarter = paste0(nextQuarter, ": ", nextCluster)) 
+
+
+sankeyData <- allUserQuarterClusters %>%
+  ungroup() %>%
+  dplyr::mutate(x = as.factor(quarter),
+         node = as.integer(cluster),
+         next_x = as.factor(nextQuarter),
+         next_node = as.integer(nextCluster)) %>%
+  dplyr::select(x, node, next_x, next_node)
+
+temp <- sankeyData %>%
+  mutate(yr = as.integer(str_sub(x, end = 4)),
+         next_yr = as.integer(str_sub(next_x, end = 4)),
+         qtr = as.integer(str_sub(x, start = 7)),
+         next_qtr = as.integer(str_sub(next_x, start=7))) %>%
+  mutate(x = as.double(yr*10+2.5*qtr),
+         next_x = as.double(next_yr*10+2.5*next_qtr))
+
+p <- ggplot(temp, aes(x = x, 
+               next_x = next_x, 
+               node = node, 
+               next_node = next_node,
+               fill = as.factor(node))) +
+  geom_sankey(flow.alpha = .5,
+              node.color = "gray30",
+              width = .5) +
+  xlab(label = "Quarter") +
+  ggtitle("Address Clusters By Quarter") +
+  theme(plot.title = element_text(hjust = .5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.title.x = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank()) +
+  scale_x_continuous(breaks = 20210 + 2.5*(1:8), 
+                     labels = quarters$quarter) +
+  scale_fill_discrete("Address Clusters",
+                      labels = c("Future Active Addresses",
+                                 clusterLabels,
+                                 "Addresses With No New Activity"))
+  
+p
+```
+
+```{r}
+
+image=ggpubr::ggpar(p,
+              font.legend = list(size = pubFontSize),
+              font.xtickslab = list(size = pubFontSize),
+              font.ytickslab = list(size = pubFontSize),
+              font.x = list(size = pubFontSize),
+              font.y = list(size = pubFontSize),
+              palette = pubColorScheme)
+ggsave(file="./Images/sankeyPlot.pdf", plot=p, width=pubWidth, height=pubHeight)
+```
+
+```{r}
+c2Toc4 <- sankeyData %>%
+  filter(node == 2) %>%
+  filter(next_node == 4)
+
+
+c5Toc4 <- sankeyData %>%
+  filter(node == 5) %>%
+  filter(next_node == 4)
+
+c2Toc9 <- sankeyData %>%
+  filter(node == 2) %>%
+  filter(next_node == 9)
+
+c5Toc9 <- sankeyData %>%
+  filter(node == 5) %>%
+  filter(next_node == 9)
+
+sd(transactionCountsByCluster$count)
+mean(transactionCountsByCluster$count)
+ 
+c7Counts <- transactionCountsByCluster %>%
+  filter(clusterLam == 7)
+
+sum(c7Counts$count) / 34082
+
+totalTransactionsByCluster <- transactionCountsByCluster %>%
+  group_by(clusterLam) %>%
+  dplyr::summarize(totalTransactions = sum(count)) %>%
+  left_join(clusterSizes, by = "clusterLam") %>%
+  mutate(averageTransactionsPerAddress = totalTransactions / amount)
+
+liqProfit <- dfWithClusters %>%
+  filter(type == "liquidated") %>%
+  dplyr::summarize(totalProfit = sum(collateralAmountUSD) - sum(principalAmountUSD))
+
+c6ToAny <- sankeyData %>%
+  filter(node == 6) %>%
+  group_by(next_node) %>%
+  dplyr::summarize(count = n())
+
+sankeyMovement <- sankeyData %>%
+  group_by(node, next_node) %>%
+  dplyr::summarize(count = n()) %>%
+  group_by(node) %>%
+  mutate(totalCount = sum(count)) %>%
+  ungroup() %>%
+  mutate(percentMovement = count / totalCount)
+
+clusteringDataWithClusters <- addressQuarterClusteringData %>%
+  bind_cols(cmeansClusters, userIDsbyQuarter) %>%
+  dplyr::rename(cluster = `...21`)
+
+clusteringDataWithClusters <- clusteringDataWithClusters %>%
+  distinct()
+
+propContract <- clusteringDataWithClusters %>%
+  group_by(cluster) %>%
+  dplyr::summarise(numContracts = sum(smartContract), totalCount = n()) %>%
+  mutate(propSmartContracts = numContracts / totalCount)
+
+smartContractAddresses <- clusteringDataWithClusters %>%
+  dplyr::select(user, smartContract) %>%
+  filter(smartContract == 1) %>%
+  dplyr::select(user)
+
+propTransactionsByContracts <- dfWithClusters %>%
+  mutate(smartContract = case_when(user %in% smartContractAddresses$user ~ 1,
+                                   TRUE ~ 0)) %>%
+  group_by(clusterLam) %>%
+  dplyr::summarise(smartContractTransactions = sum(smartContract), totalTransactions = n()) %>%
+  mutate(propSmartContract = smartContractTransactions / totalTransactions)
+
+averageTransactionsPerAddress <- dfWithClusters %>%
+  group_by(clusterLam, user, quarter) %>%
+  dplyr::summarise(numTransactions = n()) %>%
+  group_by(clusterLam) %>%
+  dplyr::summarise(averageTransactionsPerAddressQuarter = mean(numTransactions))
+
+liqByCluster <- dfWithClusters %>%
+  filter(type == "liquidationPerformed") %>%
+  group_by(clusterLam) %>%
+  dplyr::summarize(totalLiquidated = sum(amountUSD))
+
+accountsByCluster <- userClustersLam %>%
+  group_by(clusterLam) %>%
+  dplyr::summarize(count = n())
+
+anyToC9 <- sankeyData %>%
+  group_by()
+
+```
